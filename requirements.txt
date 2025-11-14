@@ -1,0 +1,6 @@
+pandas>=1.5.0
+biopython>=1.81
+aiohttp>=3.8.0
+aiohttp-retry>=2.8.3
+tqdm>=4.65.0
+termcolor>=2.3.0
