@@ -8,8 +8,11 @@ from aiohttp_retry import RetryClient, ExponentialRetry
 from tqdm import tqdm
 from termcolor import colored
 import time
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Union
 import xml.etree.ElementTree as ET
+import re
+from enum import Enum
+from abc import ABC, abstractmethod
 
 ## Basic configurations for logging
 logging.basicConfig(level=logging.INFO,
@@ -32,6 +35,322 @@ ENTREZ_API_KEY = None  ## Optional but recommended for higher rate limits
 
 ## NCBI E-utilities base URLs
 NCBI_EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+## ID Type Definitions and Patterns
+class IDType(Enum):
+    """Enumeration of supported ID types with their patterns and metadata"""
+    ENTREZ = "entrez"
+    GENBANK = "genbank"
+    REFSEQ = "refseq"
+    UNIPROT = "uniprot"
+    ENSEMBL = "ensembl"
+    EMBL = "embl"
+    UNKNOWN = "unknown"
+
+class IDPattern:
+    """Regex patterns for different ID types"""
+    PATTERNS = {
+        IDType.ENTREZ: r'^\d+$',  # Pure numeric
+        IDType.GENBANK: r'^[A-Z]{1,2}_?\d{5,}(\.\d+)?$',  # e.g., AB123456, AB_123456.1
+        IDType.REFSEQ: r'^(NC|NG|NM|NP|NR|NT|NW|XM|XP|XR|YP|AP|NZ)_\d+(\.\d+)?$',  # RefSeq format
+        IDType.UNIPROT: r'^[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$',  # UniProt KB
+        IDType.ENSEMBL: r'^ENS[A-Z]*[GPTR]\d{11}$',  # Ensembl format (ENSG, ENST, ENSP, etc.)
+        IDType.EMBL: r'^[A-Z]{1,2}\d{5,}$',  # EMBL/ENA format
+    }
+
+    @classmethod
+    def detect_id_type(cls, id_value: Union[str, int]) -> IDType:
+        """
+        Detect the type of ID based on its format
+
+        Args:
+            id_value: The ID to detect (can be string or int)
+
+        Returns:
+            IDType enum value
+        """
+        if id_value is None or (isinstance(id_value, float) and pd.isna(id_value)):
+            return IDType.UNKNOWN
+
+        # Convert to string for pattern matching
+        id_str = str(id_value).strip()
+
+        # Try each pattern
+        for id_type, pattern in cls.PATTERNS.items():
+            if re.match(pattern, id_str, re.IGNORECASE):
+                return id_type
+
+        return IDType.UNKNOWN
+
+    @classmethod
+    def validate_id(cls, id_value: Union[str, int], expected_type: IDType = None) -> bool:
+        """
+        Validate an ID against its expected type
+
+        Args:
+            id_value: The ID to validate
+            expected_type: Expected IDType (if None, auto-detect)
+
+        Returns:
+            True if valid, False otherwise
+        """
+        detected_type = cls.detect_id_type(id_value)
+
+        if expected_type is None:
+            return detected_type != IDType.UNKNOWN
+
+        return detected_type == expected_type
+
+class DatabaseAdapter(ABC):
+    """Abstract base class for database adapters"""
+
+    def __init__(self, api_key: Optional[str] = None, email: Optional[str] = None):
+        self.api_key = api_key
+        self.email = email
+
+    @abstractmethod
+    async def get_gene_info(self, gene_id: Union[str, int], session: RetryClient) -> Optional[Dict]:
+        """Fetch gene information"""
+        pass
+
+    @abstractmethod
+    async def get_sequence_ids(self, gene_id: Union[str, int], session: RetryClient) -> List[str]:
+        """Get linked sequence IDs"""
+        pass
+
+    @abstractmethod
+    async def get_sequence(self, seq_id: str, session: RetryClient) -> Optional[Tuple[str, int, str]]:
+        """Fetch sequence data"""
+        pass
+
+    @abstractmethod
+    def get_rate_limit(self) -> float:
+        """Get rate limit delay in seconds"""
+        pass
+
+class NCBIAdapter(DatabaseAdapter):
+    """Adapter for NCBI databases - supports Entrez, GenBank, RefSeq IDs"""
+
+    def __init__(self, api_key: Optional[str] = None, email: Optional[str] = None):
+        super().__init__(api_key, email)
+        self.base_url = NCBI_EUTILS_BASE
+
+    def _prepare_params(self, params: dict) -> dict:
+        """Add API key and email to parameters if available"""
+        if self.api_key:
+            params["api_key"] = self.api_key
+        if self.email:
+            params["email"] = self.email
+        return params
+
+    async def get_gene_info(self, gene_id: Union[str, int], session: RetryClient) -> Optional[Dict]:
+        """
+        Fetch gene information from NCBI
+        Supports Entrez IDs, GenBank IDs, and RefSeq IDs
+        """
+        id_type = IDPattern.detect_id_type(gene_id)
+
+        # For Entrez IDs, use gene database
+        if id_type == IDType.ENTREZ:
+            return await self._get_gene_info_by_entrez(gene_id, session)
+
+        # For GenBank/RefSeq, use nucleotide database
+        elif id_type in [IDType.GENBANK, IDType.REFSEQ]:
+            return await self._get_gene_info_by_accession(gene_id, session)
+
+        else:
+            logger.warning(f"Unsupported ID type for NCBI: {id_type} (ID: {gene_id})")
+            return None
+
+    async def _get_gene_info_by_entrez(self, entrez_id: int, session: RetryClient) -> Optional[Dict]:
+        """Fetch gene info using Entrez ID"""
+        url = f"{self.base_url}/esummary.fcgi"
+        params = self._prepare_params({
+            "db": "gene",
+            "id": entrez_id,
+            "retmode": "xml"
+        })
+
+        logger.info(f"Fetching gene info for Entrez ID: {entrez_id}")
+
+        data = await fetchWithRetry(url=url, session=session, params=params)
+
+        if not data:
+            logger.error(f"No gene info found for Entrez ID: {entrez_id}")
+            return None
+
+        try:
+            root = ET.fromstring(data)
+            gene_name = None
+            description = None
+
+            for docsum in root.findall(".//DocumentSummary"):
+                gene_name = docsum.findtext("Name")
+                description = docsum.findtext("Description")
+
+            logger.info(f"Gene info for {entrez_id}: {gene_name} - {description}")
+            return {
+                "gene_name": gene_name,
+                "description": description,
+                "gene_id": entrez_id,
+                "id_type": IDType.ENTREZ.value
+            }
+        except ET.ParseError as e:
+            logger.error(f"Error parsing XML for Entrez ID {entrez_id}: {str(e)}")
+            return None
+
+    async def _get_gene_info_by_accession(self, accession: str, session: RetryClient) -> Optional[Dict]:
+        """Fetch gene info using GenBank/RefSeq accession"""
+        url = f"{self.base_url}/esummary.fcgi"
+        params = self._prepare_params({
+            "db": "nucleotide",
+            "id": accession,
+            "retmode": "xml"
+        })
+
+        logger.info(f"Fetching sequence info for accession: {accession}")
+
+        data = await fetchWithRetry(url=url, session=session, params=params)
+
+        if not data:
+            logger.error(f"No info found for accession: {accession}")
+            return None
+
+        try:
+            root = ET.fromstring(data)
+            gene_name = None
+            description = None
+
+            for docsum in root.findall(".//DocumentSummary"):
+                description = docsum.findtext("Title")
+                # Try to extract gene name from description
+                gene_name = docsum.findtext("Caption")
+
+            id_type = IDPattern.detect_id_type(accession)
+
+            logger.info(f"Sequence info for {accession}: {gene_name} - {description}")
+            return {
+                "gene_name": gene_name,
+                "description": description,
+                "gene_id": accession,
+                "id_type": id_type.value
+            }
+        except ET.ParseError as e:
+            logger.error(f"Error parsing XML for accession {accession}: {str(e)}")
+            return None
+
+    async def get_sequence_ids(self, gene_id: Union[str, int], session: RetryClient) -> List[str]:
+        """
+        Get linked sequence IDs
+        For Entrez IDs: use elink to find nucleotide sequences
+        For GenBank/RefSeq: return the ID itself as it's already a sequence ID
+        """
+        id_type = IDPattern.detect_id_type(gene_id)
+
+        # For accession numbers, return the ID itself
+        if id_type in [IDType.GENBANK, IDType.REFSEQ]:
+            logger.info(f"ID {gene_id} is already a sequence accession")
+            return [str(gene_id)]
+
+        # For Entrez IDs, use elink
+        if id_type == IDType.ENTREZ:
+            url = f"{self.base_url}/elink.fcgi"
+            params = self._prepare_params({
+                "dbfrom": "gene",
+                "db": "nucleotide",
+                "id": gene_id,
+                "retmode": "xml"
+            })
+
+            logger.info(f"Fetching nucleotide IDs linked to Gene ID: {gene_id}")
+
+            data = await fetchWithRetry(url=url, session=session, params=params)
+
+            if not data:
+                logger.error(f"No nucleotide IDs found for Gene ID: {gene_id}")
+                return []
+
+            try:
+                root = ET.fromstring(data)
+                nucl_ids = []
+
+                for link in root.findall(".//Link/Id"):
+                    nucl_ids.append(link.text)
+
+                logger.info(f"Found {len(nucl_ids)} nucleotide IDs for Gene ID: {gene_id}")
+                return nucl_ids
+            except ET.ParseError as e:
+                logger.error(f"Error parsing XML for nucleotide IDs: {str(e)}")
+                return []
+
+        return []
+
+    async def get_sequence(self, seq_id: str, session: RetryClient) -> Optional[Tuple[str, int, str]]:
+        """Fetch sequence from NCBI Nucleotide database"""
+        url = f"{self.base_url}/efetch.fcgi"
+        params = self._prepare_params({
+            "db": "nucleotide",
+            "id": seq_id,
+            "rettype": "fasta",
+            "retmode": "text"
+        })
+
+        logger.info(f"Fetching sequence for ID: {seq_id}")
+
+        data = await fetchWithRetry(url=url, session=session, params=params)
+
+        if not data:
+            logger.error(f"No sequence found for ID: {seq_id}")
+            return None
+
+        try:
+            lines = data.strip().split('\n')
+            if len(lines) < 2:
+                logger.warning(f"Invalid FASTA format for {seq_id}")
+                return None
+
+            header = lines[0]
+            sequence = ''.join(lines[1:])
+            seq_len = len(sequence)
+
+            logger.info(f"Sequence for {seq_id}: {seq_len} bp")
+            return sequence, seq_len, seq_id
+        except Exception as e:
+            logger.error(f"Error parsing sequence for {seq_id}: {str(e)}")
+            return None
+
+    def get_rate_limit(self) -> float:
+        """Return rate limit delay for NCBI API"""
+        # With API key: 10 req/sec (0.1s), without: 3 req/sec (0.35s)
+        return 0.15 if self.api_key else 0.35
+
+def get_adapter_for_id(id_value: Union[str, int], api_key: Optional[str] = None,
+                       email: Optional[str] = None) -> Optional[DatabaseAdapter]:
+    """
+    Get the appropriate database adapter for a given ID
+
+    Args:
+        id_value: The ID to process
+        api_key: Optional API key for the database
+        email: Optional email for the database
+
+    Returns:
+        Appropriate DatabaseAdapter instance or None
+    """
+    id_type = IDPattern.detect_id_type(id_value)
+
+    # Map ID types to adapters
+    if id_type in [IDType.ENTREZ, IDType.GENBANK, IDType.REFSEQ]:
+        return NCBIAdapter(api_key=api_key, email=email)
+    elif id_type == IDType.ENSEMBL:
+        logger.warning(f"Ensembl IDs not yet implemented for ID: {id_value}")
+        return None
+    elif id_type == IDType.UNIPROT:
+        logger.warning(f"UniProt IDs not yet implemented for ID: {id_value}")
+        return None
+    else:
+        logger.warning(f"Unknown ID type for ID: {id_value}")
+        return None
 
 def init_process(miRNA_path: str) -> None:
     """Initialize global variables for each process"""
@@ -71,220 +390,53 @@ async def fetchWithRetry(url: str, session: RetryClient, params: dict = None) ->
         logger.error(f"Error fetching {url}: {str(e)}")
         return None
 
-async def getGeneInfo(entrez_id: int, session: RetryClient) -> Optional[Dict]:
+async def processGeneID(gene_id: Union[str, int], session: RetryClient) -> Tuple[Optional[str], Optional[str], int, Optional[str], str]:
     """
-    Fetch gene information from NCBI Gene database
+    Process any type of gene ID and fetch its longest sequence
+    Supports: Entrez IDs, GenBank IDs, RefSeq IDs, and more
 
     Args:
-        entrez_id: NCBI Entrez Gene ID
+        gene_id: Gene ID (can be Entrez, GenBank, RefSeq, etc.)
         session: RetryClient session
 
     Returns:
-        Dictionary with gene info or None
+        Tuple of (gene_name, accession_id, sequence_length, sequence, id_type)
     """
-    url = f"{NCBI_EUTILS_BASE}/esummary.fcgi"
-    params = {
-        "db": "gene",
-        "id": entrez_id,
-        "retmode": "xml"
-    }
+    # Detect ID type
+    id_type = IDPattern.detect_id_type(gene_id)
+    logger.info(f"Processing Gene ID: {gene_id} (detected type: {id_type.value})")
 
-    if ENTREZ_API_KEY:
-        params["api_key"] = ENTREZ_API_KEY
+    # Create cache key that includes ID type
+    cache_key = f"{id_type.value}:{gene_id}"
 
-    logger.info(f"Fetching gene info for Entrez ID: {entrez_id}")
+    if stored_cache and cache_key in stored_cache["Genes"]:
+        logger.info(f"Using cached data for ID: {gene_id} (type: {id_type.value})")
+        return stored_cache["Genes"][cache_key]
 
-    data = await fetchWithRetry(url=url, session=session, params=params)
+    # Get appropriate adapter for this ID type
+    adapter = get_adapter_for_id(gene_id, api_key=ENTREZ_API_KEY, email=ENTREZ_EMAIL)
 
-    if not data:
-        logger.error(f"No gene info found for Entrez ID: {entrez_id}")
-        return None
-
-    try:
-        root = ET.fromstring(data)
-        gene_name = None
-        description = None
-
-        # Parse XML response
-        for docsum in root.findall(".//DocumentSummary"):
-            gene_name = docsum.findtext("Name")
-            description = docsum.findtext("Description")
-
-        logger.info(f"Gene info for {entrez_id}: {gene_name} - {description}")
-        return {
-            "gene_name": gene_name,
-            "description": description,
-            "entrez_id": entrez_id
-        }
-    except ET.ParseError as e:
-        logger.error(f"Error parsing XML for Entrez ID {entrez_id}: {str(e)}")
-        return None
-
-async def getNucleotideIDs(entrez_id: int, session: RetryClient) -> List[str]:
-    """
-    Get nucleotide sequence IDs linked to a gene Entrez ID
-
-    Args:
-        entrez_id: NCBI Entrez Gene ID
-        session: RetryClient session
-
-    Returns:
-        List of nucleotide accession IDs
-    """
-    url = f"{NCBI_EUTILS_BASE}/elink.fcgi"
-    params = {
-        "dbfrom": "gene",
-        "db": "nucleotide",
-        "id": entrez_id,
-        "retmode": "xml"
-    }
-
-    if ENTREZ_API_KEY:
-        params["api_key"] = ENTREZ_API_KEY
-
-    logger.info(f"Fetching nucleotide IDs linked to Gene ID: {entrez_id}")
-
-    data = await fetchWithRetry(url=url, session=session, params=params)
-
-    if not data:
-        logger.error(f"No nucleotide IDs found for Gene ID: {entrez_id}")
-        return []
-
-    try:
-        root = ET.fromstring(data)
-        nucl_ids = []
-
-        # Parse linked IDs from XML
-        for link in root.findall(".//Link/Id"):
-            nucl_ids.append(link.text)
-
-        logger.info(f"Found {len(nucl_ids)} nucleotide IDs for Gene ID: {entrez_id}")
-        return nucl_ids
-    except ET.ParseError as e:
-        logger.error(f"Error parsing XML for nucleotide IDs: {str(e)}")
-        return []
-
-async def getSequence(nucl_id: str, session: RetryClient) -> Optional[Tuple[str, int, str]]:
-    """
-    Fetch sequence from NCBI Nucleotide database
-
-    Args:
-        nucl_id: Nucleotide accession ID
-        session: RetryClient session
-
-    Returns:
-        Tuple of (sequence, length, accession) or None
-    """
-    url = f"{NCBI_EUTILS_BASE}/efetch.fcgi"
-    params = {
-        "db": "nucleotide",
-        "id": nucl_id,
-        "rettype": "fasta",
-        "retmode": "text"
-    }
-
-    if ENTREZ_API_KEY:
-        params["api_key"] = ENTREZ_API_KEY
-
-    logger.info(f"Fetching sequence for Nucleotide ID: {nucl_id}")
-
-    data = await fetchWithRetry(url=url, session=session, params=params)
-
-    if not data:
-        logger.error(f"No sequence found for Nucleotide ID: {nucl_id}")
-        return None
-
-    try:
-        # Parse FASTA format
-        lines = data.strip().split('\n')
-        if len(lines) < 2:
-            logger.warning(f"Invalid FASTA format for {nucl_id}")
-            return None
-
-        header = lines[0]
-        sequence = ''.join(lines[1:])
-        seq_len = len(sequence)
-
-        logger.info(f"Sequence for {nucl_id}: {seq_len} bp")
-        return sequence, seq_len, nucl_id
-    except Exception as e:
-        logger.error(f"Error parsing sequence for {nucl_id}: {str(e)}")
-        return None
-
-async def getSequenceByGeneID(entrez_id: int, session: RetryClient) -> Optional[Tuple[str, int, str]]:
-    """
-    Alternative method: Fetch sequence directly using gene ID
-    This is useful for viral genes that might not have proper linking
-
-    Args:
-        entrez_id: NCBI Entrez Gene ID
-        session: RetryClient session
-
-    Returns:
-        Tuple of (sequence, length, accession) or None
-    """
-    # First, try to get the gene info to find associated sequences
-    url = f"{NCBI_EUTILS_BASE}/efetch.fcgi"
-    params = {
-        "db": "gene",
-        "id": entrez_id,
-        "rettype": "gene_fasta",
-        "retmode": "text"
-    }
-
-    if ENTREZ_API_KEY:
-        params["api_key"] = ENTREZ_API_KEY
-
-    logger.info(f"Attempting direct sequence fetch for Gene ID: {entrez_id}")
-
-    data = await fetchWithRetry(url=url, session=session, params=params)
-
-    if data and data.strip():
-        try:
-            lines = data.strip().split('\n')
-            if len(lines) >= 2 and lines[0].startswith('>'):
-                sequence = ''.join(lines[1:])
-                seq_len = len(sequence)
-                logger.info(f"Direct fetch successful for Gene ID {entrez_id}: {seq_len} bp")
-                return sequence, seq_len, str(entrez_id)
-        except Exception as e:
-            logger.error(f"Error parsing direct fetch for {entrez_id}: {str(e)}")
-
-    return None
-
-async def processViralGene(entrez_id: int, session: RetryClient) -> Tuple[Optional[str], Optional[str], int, Optional[str]]:
-    """
-    Process a viral gene Entrez ID and fetch its longest sequence
-
-    Args:
-        entrez_id: NCBI Entrez Gene ID
-        session: RetryClient session
-
-    Returns:
-        Tuple of (gene_name, accession_id, sequence_length, sequence)
-    """
-    logger.info(f"Processing viral Gene Entrez ID: {entrez_id}")
-
-    if stored_cache and entrez_id in stored_cache["Genes"]:
-        logger.info(f"Using cached data for Entrez ID: {entrez_id}")
-        return stored_cache["Genes"][entrez_id]
+    if not adapter:
+        logger.error(f"No adapter available for ID: {gene_id} (type: {id_type.value})")
+        return None, None, 0, None, id_type.value
 
     # Get gene information
-    gene_info = await getGeneInfo(entrez_id=entrez_id, session=session)
+    gene_info = await adapter.get_gene_info(gene_id=gene_id, session=session)
     gene_name = gene_info["gene_name"] if gene_info else None
 
-    # Try to get linked nucleotide sequences
-    nucl_ids = await getNucleotideIDs(entrez_id=entrez_id, session=session)
+    # Get linked sequence IDs
+    seq_ids = await adapter.get_sequence_ids(gene_id=gene_id, session=session)
 
     max_seq_accession = None
     max_seq_len = 0
     max_seq = None
 
-    if nucl_ids:
-        logger.info(f"Analyzing {len(nucl_ids)} nucleotide sequences for Gene ID: {entrez_id}")
+    if seq_ids:
+        logger.info(f"Analyzing {len(seq_ids)} sequences for Gene ID: {gene_id}")
 
-        for nucl_id in nucl_ids[:10]:  # Limit to first 10 to avoid excessive API calls
-            result = await getSequence(nucl_id=nucl_id, session=session)
+        # Limit to first 10 to avoid excessive API calls
+        for seq_id in seq_ids[:10]:
+            result = await adapter.get_sequence(seq_id=seq_id, session=session)
 
             if result:
                 seq, seq_len, accession = result
@@ -293,31 +445,26 @@ async def processViralGene(entrez_id: int, session: RetryClient) -> Tuple[Option
                     max_seq_len = seq_len
                     max_seq = seq
 
-            # Rate limiting for NCBI API (max 10 requests/second without API key, 3/second with key)
-            await asyncio.sleep(0.15 if ENTREZ_API_KEY else 0.35)
+            # Rate limiting based on adapter
+            await asyncio.sleep(adapter.get_rate_limit())
 
-    # If no sequences found through linking, try direct fetch
-    if max_seq is None:
-        logger.info(f"No linked sequences found, trying direct fetch for Gene ID: {entrez_id}")
-        result = await getSequenceByGeneID(entrez_id=entrez_id, session=session)
-
-        if result:
-            max_seq, max_seq_len, max_seq_accession = result
-
-    # Cache the result
+    # Cache the result with type-aware key
     if stored_cache:
-        stored_cache["Genes"][entrez_id] = (gene_name, max_seq_accession, max_seq_len, max_seq)
+        stored_cache["Genes"][cache_key] = (gene_name, max_seq_accession, max_seq_len, max_seq, id_type.value)
 
-    return gene_name, max_seq_accession, max_seq_len, max_seq
+    return gene_name, max_seq_accession, max_seq_len, max_seq, id_type.value
 
-async def process_row(row: pd.Series, session: RetryClient, semaphore: asyncio.Semaphore) -> dict:
+async def process_row(row: pd.Series, session: RetryClient, semaphore: asyncio.Semaphore,
+                     gene_id_column: str = 'Target Gene (Entrez ID)') -> dict:
     """
     Process a single row from the dataset
+    Now supports ANY ID type (Entrez, GenBank, RefSeq, etc.)
 
     Args:
         row: Pandas Series containing row data
         session: RetryClient session
         semaphore: Asyncio semaphore for concurrency control
+        gene_id_column: Name of the column containing gene IDs (default: 'Target Gene (Entrez ID)')
 
     Returns:
         Dictionary with processed data
@@ -325,31 +472,42 @@ async def process_row(row: pd.Series, session: RetryClient, semaphore: asyncio.S
     async with semaphore:
         logger.info(f"\n{"#"*100}\n\t\t Starting Row Processing\n{"#"*100}\n{row.to_string()}\n")
 
-        # Extract data from row - adjust column names as needed for viral data
-        entrez_id = int(row['Target Gene (Entrez ID)']) if not pd.isna(row['Target Gene (Entrez ID)']) else None
+        # Extract gene ID - support flexible column names
+        gene_id = None
+        if gene_id_column in row.index and not pd.isna(row[gene_id_column]):
+            gene_id_raw = row[gene_id_column]
+            # Try to preserve type (int vs string)
+            id_type = IDPattern.detect_id_type(gene_id_raw)
+            if id_type == IDType.ENTREZ:
+                gene_id = int(gene_id_raw)
+            else:
+                gene_id = str(gene_id_raw).strip()
+
+        # Extract other data from row
         miRNA = row['miRNA'] if not pd.isna(row['miRNA']) else None
         miRNATarBaseID = row.get('miRTarBase ID', None) if not pd.isna(row.get('miRTarBase ID', None)) else None
         targetGeneSymbol = row.get('Target Gene', None) if not pd.isna(row.get('Target Gene', None)) else None
         reference = int(row['References (PMID)']) if not pd.isna(row.get('References (PMID)', None)) else None
 
         # Handle missing critical data
-        if miRNA is None or entrez_id is None:
+        if miRNA is None or gene_id is None:
             return {
                 "miRTarBase ID": miRNATarBaseID,
                 "miRNA": miRNA,
                 "Gene Symbol": targetGeneSymbol,
-                "Entrez ID": entrez_id,
+                "Gene ID": gene_id,
+                "ID Type": IDPattern.detect_id_type(gene_id).value if gene_id else "unknown",
                 "Gene Name": None,
-                "Nucleotide Accession": None,
+                "Sequence Accession": None,
                 "miRNA Sequence Length": None,
-                "Viral Sequence Length": None,
+                "Target Sequence Length": None,
                 "miRNA Sequence": None,
-                "Viral Sequence": None,
+                "Target Sequence": None,
                 "Reference": reference
             }
 
-        # Process the viral gene
-        gene_name, seq_accession, seq_len, seq = await processViralGene(entrez_id=entrez_id, session=session)
+        # Process the gene ID (works with any ID type!)
+        gene_name, seq_accession, seq_len, seq, detected_id_type = await processGeneID(gene_id=gene_id, session=session)
 
         # Get miRNA sequence from database
         miRNA_seq, miRNA_seq_len = miRNA_db.get(miRNA, (None, None)) if miRNA_db else (None, None)
@@ -358,22 +516,55 @@ async def process_row(row: pd.Series, session: RetryClient, semaphore: asyncio.S
             "miRTarBase ID": miRNATarBaseID,
             "miRNA": miRNA,
             "Gene Symbol": targetGeneSymbol,
-            "Entrez ID": entrez_id,
+            "Gene ID": gene_id,
+            "ID Type": detected_id_type,
             "Gene Name": gene_name,
-            "Nucleotide Accession": seq_accession,
+            "Sequence Accession": seq_accession,
             "miRNA Sequence Length": miRNA_seq_len,
-            "Viral Sequence Length": seq_len,
+            "Target Sequence Length": seq_len,
             "miRNA Sequence": miRNA_seq,
-            "Viral Sequence": seq,
+            "Target Sequence": seq,
             "Reference": reference
         }
 
-async def process_chunk(chunk_df: pd.DataFrame):
+def detect_gene_id_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Auto-detect the column containing gene IDs
+
+    Args:
+        df: Pandas DataFrame
+
+    Returns:
+        Column name or None
+    """
+    # Common column name patterns for gene IDs
+    common_patterns = [
+        r'.*gene.*id.*',
+        r'.*entrez.*',
+        r'.*genbank.*',
+        r'.*refseq.*',
+        r'.*accession.*',
+        r'.*target.*id.*',
+    ]
+
+    for col in df.columns:
+        col_lower = col.lower()
+        for pattern in common_patterns:
+            if re.match(pattern, col_lower, re.IGNORECASE):
+                logger.info(f"Auto-detected gene ID column: {col}")
+                return col
+
+    logger.warning("Could not auto-detect gene ID column. Please specify manually.")
+    return None
+
+async def process_chunk(chunk_df: pd.DataFrame, gene_id_column: str = 'Target Gene (Entrez ID)'):
     """
     Process a chunk of the dataframe asynchronously
+    Now supports any ID type with configurable column name
 
     Args:
         chunk_df: Pandas DataFrame chunk
+        gene_id_column: Name of column containing gene IDs
 
     Returns:
         List of processed results
@@ -386,9 +577,9 @@ async def process_chunk(chunk_df: pd.DataFrame):
     )
 
     async with RetryClient(retry_options=retry_options) as session:
-        # Lower concurrency limit for NCBI API to respect rate limits
+        # Concurrency limit - can be adjusted based on API
         semaphore = asyncio.Semaphore(3 if ENTREZ_API_KEY else 2)
-        tasks = [process_row(row, session, semaphore) for _, row in chunk_df.iterrows()]
+        tasks = [process_row(row, session, semaphore, gene_id_column) for _, row in chunk_df.iterrows()]
         results = []
 
         for future in asyncio.as_completed(tasks):
@@ -397,17 +588,19 @@ async def process_chunk(chunk_df: pd.DataFrame):
 
         return results
 
-def run_async_chunk(chunk: pd.DataFrame):
+def run_async_chunk(args):
     """
     Wrapper to run async chunk processing
+    Now accepts tuple of (chunk, gene_id_column)
 
     Args:
-        chunk: Pandas DataFrame chunk
+        args: Tuple of (chunk, gene_id_column)
 
     Returns:
         List of processed results
     """
-    return asyncio.run(process_chunk(chunk))
+    chunk, gene_id_column = args
+    return asyncio.run(process_chunk(chunk, gene_id_column))
 
 def createChunks(df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
     """
@@ -425,36 +618,81 @@ def createChunks(df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
     return [df.iloc[i:i+n_chunks] for i in range(0, len(df), n_chunks)]
 
 if __name__ == "__main__":
+    # ==================== CONFIGURATION ====================
     # File paths - adjust as needed
     miRNA_path = "../Data/mature_mRNA_mirBase.fa"
-    viral_data_path = "../Data/viral_mirTarbase.csv"  # Adjust to your viral dataset
+    data_path = "../Data/viral_mirTarbase.csv"
 
     # IMPORTANT: Set your email for NCBI (required)
     ENTREZ_EMAIL = "your.email@example.com"  # CHANGE THIS!
     # Optional: Set API key for higher rate limits (get from https://www.ncbi.nlm.nih.gov/account/)
     # ENTREZ_API_KEY = "your_api_key_here"
 
-    logger.info(f"Loading viral miRTarBase DataFrame from {viral_data_path}")
+    # Gene ID column configuration
+    # Set to None for auto-detection, or specify the column name
+    # Examples: 'Target Gene (Entrez ID)', 'GenBank Accession', 'RefSeq ID', etc.
+    GENE_ID_COLUMN = None  # Auto-detect
+    # GENE_ID_COLUMN = 'Target Gene (Entrez ID)'  # Explicit column name
+
+    # Output file path
+    OUTPUT_PATH = "Data/universal_pipeline_results.csv"
+    # =======================================================
+
+    logger.info(f"Loading miRTarBase DataFrame from {data_path}")
+    logger.info("=" * 80)
+    logger.info("UNIVERSAL ID PROCESSOR - Supports Entrez, GenBank, RefSeq, and more!")
+    logger.info("=" * 80)
 
     try:
-        mirBase_df = pd.read_csv(viral_data_path)
-        # Adjust column processing based on your viral dataset structure
+        mirBase_df = pd.read_csv(data_path)
+
+        # Display available columns
+        logger.info(f"Available columns: {list(mirBase_df.columns)}")
+
+        # Auto-detect or validate gene ID column
+        if GENE_ID_COLUMN is None:
+            detected_column = detect_gene_id_column(mirBase_df)
+            if detected_column:
+                GENE_ID_COLUMN = detected_column
+                logger.info(f"Using auto-detected column: {GENE_ID_COLUMN}")
+            else:
+                logger.error("Could not auto-detect gene ID column. Please specify GENE_ID_COLUMN manually.")
+                logger.info(f"Available columns: {list(mirBase_df.columns)}")
+                exit(1)
+        else:
+            if GENE_ID_COLUMN not in mirBase_df.columns:
+                logger.error(f"Specified column '{GENE_ID_COLUMN}' not found in dataset.")
+                logger.info(f"Available columns: {list(mirBase_df.columns)}")
+                exit(1)
+            logger.info(f"Using specified column: {GENE_ID_COLUMN}")
+
+        # Analyze ID types in the dataset
+        logger.info("Analyzing ID types in dataset...")
+        sample_ids = mirBase_df[GENE_ID_COLUMN].dropna().head(10)
+        id_type_counts = {}
+        for sample_id in sample_ids:
+            id_type = IDPattern.detect_id_type(sample_id)
+            id_type_counts[id_type.value] = id_type_counts.get(id_type.value, 0) + 1
+            logger.info(f"  Sample ID: {sample_id} -> Type: {id_type.value}")
+
+        logger.info(f"ID type distribution in sample: {id_type_counts}")
+
+        # Drop unnecessary columns if present
         if 'Experiments' in mirBase_df.columns:
             mirBase_df = mirBase_df.drop(columns=['Experiments'])
         if 'Support Type' in mirBase_df.columns:
             mirBase_df = mirBase_df.drop(columns=['Support Type'])
 
         mirBase_df = mirBase_df.drop_duplicates().reset_index(drop=True)
-        logger.info(f"Loaded viral dataset with {len(mirBase_df)} rows after processing.")
+        logger.info(f"Loaded dataset with {len(mirBase_df)} rows after processing.")
     except FileNotFoundError:
-        logger.error(f"File not found: {viral_data_path}")
-        logger.info("Please ensure you have a CSV file with columns: 'miRNA', 'Target Gene (Entrez ID)', etc.")
+        logger.error(f"File not found: {data_path}")
+        logger.info("Please ensure you have a CSV file with columns: 'miRNA', gene ID column, etc.")
         exit(1)
 
-    # Adjust process count for API rate limits (NCBI is stricter than Ensembl)
-    # Without API key: max 3 requests/second
-    # With API key: max 10 requests/second
-    number_of_processes = min(cpu_count(), 4)  # Limit to 4 processes for NCBI API
+    # Adjust process count for API rate limits
+    # NCBI: Without API key: max 3 requests/second, With API key: max 10 requests/second
+    number_of_processes = min(cpu_count(), 4)
     logger.info(f"Number of Processes: {number_of_processes}")
 
     chunk_size = max(1, len(mirBase_df) // (number_of_processes * 2))
@@ -464,23 +702,33 @@ if __name__ == "__main__":
     lock = manager.Lock()
 
     starting_count = 0
-    with tqdm(total=len(mirBase_df), desc="Processing viral genes") as progress_bar:
+    with tqdm(total=len(mirBase_df), desc="Processing genes (any ID type)") as progress_bar:
         with Pool(processes=number_of_processes, initializer=init_process, initargs=(miRNA_path,)) as pool:
             results = []
-            for result in pool.imap_unordered(run_async_chunk, createChunks(mirBase_df, chunk_size=chunk_size)):
+            # Create argument tuples with gene_id_column
+            chunk_args = [(chunk, GENE_ID_COLUMN) for chunk in createChunks(mirBase_df, chunk_size=chunk_size)]
+
+            for result in pool.imap_unordered(run_async_chunk, chunk_args):
                 results.extend(result)
                 with lock:
                     progress_bar.update(len(result))
                     starting_count += len(result)
                     print(f"Processed {colored(starting_count, 'green', attrs=['bold'])} "
-                          f"out of {colored(len(mirBase_df), 'blue', attrs=['bold'])} viral genes")
-                    logger.info(f"Processed {starting_count} out of {len(mirBase_df)} viral genes")
+                          f"out of {colored(len(mirBase_df), 'blue', attrs=['bold'])} genes")
+                    logger.info(f"Processed {starting_count} out of {len(mirBase_df)} genes")
 
             final_df = pd.DataFrame(results)
             print("\nFinal Results:")
             print(final_df)
 
-            output_path = "Data/viral_pipeline_results.csv"
-            final_df.to_csv(output_path, index=False)
-            logger.info(f"Results saved to {output_path}")
-            print(f"\nResults saved to {colored(output_path, 'cyan', attrs=['bold'])}")
+            final_df.to_csv(OUTPUT_PATH, index=False)
+            logger.info(f"Results saved to {OUTPUT_PATH}")
+            print(f"\nResults saved to {colored(OUTPUT_PATH, 'cyan', attrs=['bold'])}")
+
+            # Display ID type statistics
+            if 'ID Type' in final_df.columns:
+                id_type_stats = final_df['ID Type'].value_counts()
+                print(f"\n{colored('ID Type Statistics:', 'yellow', attrs=['bold'])}")
+                for id_type, count in id_type_stats.items():
+                    print(f"  {id_type}: {colored(count, 'cyan', attrs=['bold'])}")
+                logger.info(f"ID type statistics: {id_type_stats.to_dict()}")
